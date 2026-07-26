@@ -218,8 +218,40 @@ static int olh_nvapi_detect_titan(olh_nvapi_gpu* out, int max, char* err, int er
     return found;
 }
 
-static int olh_nvapi_set_zone(NV_PHYSICAL_GPU_HANDLE handle, int zone, NV_U8 red, NV_U8 green, NV_U8 blue, NV_U8 brightness, int treats_rgbw_as_rgb, char* err, int err_len) {
+// The zone control block handed back by ClientIllumZonesGetControl is fixed for
+// the life of the GPU: the zone count, the per zone type and the reserved
+// fields are all settled once the board has been enumerated. Reading it back
+// before every write therefore spends a full NVAPI round trip, and the settle
+// delay that goes with it, re-fetching data we already hold. Keep the block the
+// driver gave us on first use and mutate it in place from then on, so a steady
+// state write is a single SetControl call. A failed write drops the cache so
+// the next one re-reads.
+#define OLH_NVAPI_CACHE_MAX 8
+
+typedef struct {
+    NV_PHYSICAL_GPU_HANDLE handle;
     olh_nvapi_zone_control_params params;
+    int valid;
+} olh_nvapi_zone_cache;
+
+static olh_nvapi_zone_cache olh_nvapi_cache[OLH_NVAPI_CACHE_MAX];
+
+static olh_nvapi_zone_cache* olh_nvapi_cache_slot(NV_PHYSICAL_GPU_HANDLE handle) {
+    int spare = -1;
+    for(int i = 0; i < OLH_NVAPI_CACHE_MAX; i++) {
+        if(olh_nvapi_cache[i].valid && olh_nvapi_cache[i].handle == handle) {
+            return &olh_nvapi_cache[i];
+        }
+        if(!olh_nvapi_cache[i].valid && spare < 0) {
+            spare = i;
+        }
+    }
+    return spare < 0 ? 0 : &olh_nvapi_cache[spare];
+}
+
+static int olh_nvapi_set_zone(NV_PHYSICAL_GPU_HANDLE handle, int zone, NV_U8 red, NV_U8 green, NV_U8 blue, NV_U8 brightness, int treats_rgbw_as_rgb, char* err, int err_len) {
+    olh_nvapi_zone_cache* cache;
+    olh_nvapi_zone_control_params* params;
     NV_STATUS status;
 
     if(!handle) {
@@ -231,22 +263,33 @@ static int olh_nvapi_set_zone(NV_PHYSICAL_GPU_HANDLE handle, int zone, NV_U8 red
         return -1;
     }
 
-    memset(&params, 0, sizeof(params));
-    params.version = OLH_NVIDIA_ILLUM_PARAMS_VERSION;
-    params.bDefault = 0;
-    status = olh_nvapi_gpu_client_illum_zones_get_control(handle, &params);
-    usleep(30000);
-    if(status != OLH_NVAPI_OK) {
-        snprintf(err, (size_t)err_len, "NvAPI_GPU_ClientIllumZonesGetControl returned %d", status);
-        return status;
+    cache = olh_nvapi_cache_slot(handle);
+    if(!cache) {
+        olh_set_error(err, err_len, "NVAPI illumination zone cache exhausted");
+        return -1;
     }
 
-    if(zone < 0 || (NV_U32)zone >= params.numIllumZonesControl || zone >= OLH_NVIDIA_ILLUM_ZONE_COUNT_MAX) {
+    if(!cache->valid) {
+        memset(&cache->params, 0, sizeof(cache->params));
+        cache->params.version = OLH_NVIDIA_ILLUM_PARAMS_VERSION;
+        cache->params.bDefault = 0;
+        status = olh_nvapi_gpu_client_illum_zones_get_control(handle, &cache->params);
+        if(status != OLH_NVAPI_OK) {
+            snprintf(err, (size_t)err_len, "NvAPI_GPU_ClientIllumZonesGetControl returned %d", status);
+            return status;
+        }
+        usleep(30000);
+        cache->handle = handle;
+        cache->valid = 1;
+    }
+    params = &cache->params;
+
+    if(zone < 0 || (NV_U32)zone >= params->numIllumZonesControl || zone >= OLH_NVIDIA_ILLUM_ZONE_COUNT_MAX) {
         olh_set_error(err, err_len, "invalid NVAPI illumination zone");
         return -2;
     }
 
-    olh_nvapi_zone_control* z = &params.zones[zone];
+    olh_nvapi_zone_control* z = &params->zones[zone];
     z->ctrlMode = OLH_NVIDIA_CTRL_MODE_MANUAL_RGB;
 
     switch(z->type) {
@@ -288,9 +331,13 @@ static int olh_nvapi_set_zone(NV_PHYSICAL_GPU_HANDLE handle, int zone, NV_U8 red
         return -3;
     }
 
-    status = olh_nvapi_gpu_client_illum_zones_set_control(handle, &params);
-    usleep(30000);
+    // No settle delay here. The controller still needs spacing between writes,
+    // but sleeping inside cgo pins an OS thread for the duration and, when this
+    // ran from a request handler, held the caller too. The writer goroutine
+    // paces the writes instead.
+    status = olh_nvapi_gpu_client_illum_zones_set_control(handle, params);
     if(status != OLH_NVAPI_OK) {
+        cache->valid = 0;
         snprintf(err, (size_t)err_len, "NvAPI_GPU_ClientIllumZonesSetControl returned %d", status);
         return status;
     }

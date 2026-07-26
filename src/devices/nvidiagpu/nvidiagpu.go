@@ -80,7 +80,28 @@ type Device struct {
 	native           nativeGPU
 	mutex            sync.Mutex
 	rgbMutex         sync.RWMutex
+
+	nvapiMutex   sync.Mutex
+	zoneMutex    sync.Mutex
+	zonePending  map[int][4]byte
+	zoneSignal   chan struct{}
+	profileMutex sync.Mutex
+	profileDirty bool
+	workerStop   chan struct{}
+	workerOnce   sync.Once
+	workerGroup  sync.WaitGroup
 }
+
+const (
+	// hardwareWriteInterval paces illumination writes. The board's RGB
+	// controller is reached over a slow internal link and dislikes back to back
+	// transactions. This spacing used to live inside the cgo call, where it both
+	// pinned an OS thread and stalled the caller; here it costs neither.
+	hardwareWriteInterval = 30 * time.Millisecond
+
+	// profileFlushInterval bounds how often brightness changes reach the disk.
+	profileFlushInterval = 2 * time.Second
+)
 
 var (
 	pwd      = ""
@@ -158,7 +179,7 @@ func newDevice(index int, gpu nativeGPU) *Device {
 		}
 	}
 
-	return &Device{
+	device := &Device{
 		Manufacturer:  "NVIDIA",
 		Product:       gpu.Name,
 		Serial:        serial,
@@ -170,6 +191,135 @@ func newDevice(index int, gpu nativeGPU) *Device {
 		RGBDeviceOnly: true,
 		RGBModes:      rgbModes,
 		native:        gpu,
+	}
+	device.startWorkers()
+	return device
+}
+
+func (d *Device) startWorkers() {
+	d.zonePending = make(map[int][4]byte, len(d.Devices))
+	d.zoneSignal = make(chan struct{}, 1)
+	d.workerStop = make(chan struct{})
+
+	d.workerGroup.Add(2)
+	go d.zoneWriter()
+	go d.profileFlusher()
+}
+
+func (d *Device) stopWorkers() {
+	d.workerOnce.Do(func() { close(d.workerStop) })
+	d.workerGroup.Wait()
+}
+
+// queueZoneWrite records the newest colour for a zone. A zone holds at most one
+// pending value: an update that has not reached the hardware yet is already
+// stale once a newer one arrives, so it is replaced rather than queued behind
+// it. That is what keeps a client writing faster than the GPU can accept from
+// building an unbounded backlog.
+func (d *Device) queueZoneWrite(channelId int, red, green, blue, brightness uint8) {
+	d.zoneMutex.Lock()
+	d.zonePending[channelId] = [4]byte{red, green, blue, brightness}
+	d.zoneMutex.Unlock()
+
+	select {
+	case d.zoneSignal <- struct{}{}:
+	default:
+	}
+}
+
+func (d *Device) takeZoneWrites() map[int][4]byte {
+	d.zoneMutex.Lock()
+	defer d.zoneMutex.Unlock()
+
+	if len(d.zonePending) == 0 {
+		return nil
+	}
+	pending := d.zonePending
+	d.zonePending = make(map[int][4]byte, len(pending))
+	return pending
+}
+
+func (d *Device) zoneWriter() {
+	defer d.workerGroup.Done()
+
+	for {
+		select {
+		case <-d.workerStop:
+			return
+		case <-d.zoneSignal:
+		}
+
+		for {
+			pending := d.takeZoneWrites()
+			if len(pending) == 0 {
+				break
+			}
+
+			channels := make([]int, 0, len(pending))
+			for channelId := range pending {
+				channels = append(channels, channelId)
+			}
+			sort.Ints(channels)
+
+			for _, channelId := range channels {
+				select {
+				case <-d.workerStop:
+					return
+				default:
+				}
+				colour := pending[channelId]
+				d.writeZone(channelId, colour[0], colour[1], colour[2], colour[3])
+			}
+		}
+	}
+}
+
+// writeZone performs the NVAPI write and holds the controller's settle time.
+func (d *Device) writeZone(channelId int, red, green, blue, brightness uint8) {
+	d.nvapiMutex.Lock()
+	err := setNativeZone(d.native.Handle, channelId, red, green, blue, brightness, d.native.TreatsRGBWAsRGB)
+	d.nvapiMutex.Unlock()
+
+	if err != nil {
+		logger.Log(logger.Fields{"error": err, "serial": d.Serial, "zone": channelId}).Warn("Unable to set NVIDIA GPU RGB zone")
+	}
+	time.Sleep(hardwareWriteInterval)
+}
+
+// scheduleDeviceProfileSave marks the profile dirty for the flusher. Brightness
+// is driven from the API at rates where writing the file, and re-reading the
+// whole profile directory, on every change is pure churn: only the last value
+// matters.
+func (d *Device) scheduleDeviceProfileSave() {
+	d.profileMutex.Lock()
+	d.profileDirty = true
+	d.profileMutex.Unlock()
+}
+
+func (d *Device) flushDeviceProfile() {
+	d.profileMutex.Lock()
+	dirty := d.profileDirty
+	d.profileDirty = false
+	d.profileMutex.Unlock()
+
+	if dirty {
+		d.saveDeviceProfile()
+	}
+}
+
+func (d *Device) profileFlusher() {
+	defer d.workerGroup.Done()
+
+	ticker := time.NewTicker(profileFlushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.workerStop:
+			return
+		case <-ticker.C:
+			d.flushDeviceProfile()
+		}
 	}
 }
 
@@ -222,8 +372,20 @@ func (d *Device) GetRgbProfile(profile string) *rgb.Profile {
 func (d *Device) Stop() {
 	logger.Log(logger.Fields{"serial": d.Serial, "product": d.Product}).Info("Stopping device...")
 	d.stopActiveRgb()
-	d.writeAllZones([]byte{0, 0, 0})
 	d.Exit = true
+	d.stopWorkers()
+	d.flushDeviceProfile()
+
+	// The writer is down by now, so drive the blackout directly rather than
+	// queueing work nothing is left to drain.
+	channels := make([]int, 0, len(d.Devices))
+	for channelId := range d.Devices {
+		channels = append(channels, channelId)
+	}
+	sort.Ints(channels)
+	for _, channelId := range channels {
+		d.writeZone(channelId, 0, 0, 0, 0)
+	}
 	logger.Log(logger.Fields{"serial": d.Serial, "product": d.Product}).Info("Device stopped")
 }
 
@@ -280,7 +442,10 @@ func (d *Device) ChangeDeviceBrightnessValue(value uint8) uint8 {
 		return 0
 	}
 	d.DeviceProfile.BrightnessSlider = &value
-	d.saveDeviceProfile()
+	// Deliberately deferred: this is the endpoint clients sweep to fade the
+	// lighting, so it is reached far too often to persist synchronously. Every
+	// other profile mutation still saves immediately.
+	d.scheduleDeviceProfileSave()
 	d.restartRgb()
 	return 1
 }
@@ -807,9 +972,7 @@ func (d *Device) writeColor(data []byte, channelId int) {
 		brightness = 0
 	}
 
-	if err := setNativeZone(d.native.Handle, channelId, data[0], data[1], data[2], brightness, d.native.TreatsRGBWAsRGB); err != nil {
-		logger.Log(logger.Fields{"error": err, "serial": d.Serial, "zone": channelId}).Warn("Unable to set NVIDIA GPU RGB zone")
-	}
+	d.queueZoneWrite(channelId, data[0], data[1], data[2], brightness)
 }
 
 func (d *Device) currentBrightnessPercent() uint8 {
