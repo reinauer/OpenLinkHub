@@ -249,7 +249,13 @@ static olh_nvapi_zone_cache* olh_nvapi_cache_slot(NV_PHYSICAL_GPU_HANDLE handle)
     return spare < 0 ? 0 : &olh_nvapi_cache[spare];
 }
 
-static int olh_nvapi_set_zone(NV_PHYSICAL_GPU_HANDLE handle, int zone, NV_U8 red, NV_U8 green, NV_U8 blue, NV_U8 brightness, int treats_rgbw_as_rgb, char* err, int err_len) {
+// The GPU handle is an opaque driver token rather than anything Go allocated,
+// so it crosses the boundary as an integer and is cast back here. Passing it as
+// a pointer would mean converting uintptr to unsafe.Pointer on the Go side,
+// which go vet flags because that conversion is only sound for addresses the
+// collector is not free to move. Keeping the cast in C says what is true.
+static int olh_nvapi_set_zone(uintptr_t handle_value, int zone, NV_U8 red, NV_U8 green, NV_U8 blue, NV_U8 brightness, int treats_rgbw_as_rgb, char* err, int err_len) {
+    NV_PHYSICAL_GPU_HANDLE handle = (NV_PHYSICAL_GPU_HANDLE)handle_value;
     olh_nvapi_zone_cache* cache;
     olh_nvapi_zone_control_params* params;
     NV_STATUS status;
@@ -399,7 +405,7 @@ func setNativeZone(handle uintptr, zone int, red, green, blue, brightness uint8,
 		treats = 1
 	}
 	status := C.olh_nvapi_set_zone(
-		(C.NV_PHYSICAL_GPU_HANDLE)(unsafe.Pointer(handle)),
+		C.uintptr_t(handle),
 		C.int(zone),
 		C.NV_U8(red),
 		C.NV_U8(green),
